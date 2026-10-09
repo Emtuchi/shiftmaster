@@ -1,6 +1,7 @@
-import { jwtVerify, JWTPayload } from "jose";
-import { Request } from "express";
-import { Route } from "../config/routes";
+import { jwtVerify} from "jose";
+import type { JWTPayload } from "jose";
+import type { Request } from "express";
+import type { Route } from "../config/routes.js";
 
 const JWT_SECRET = new TextEncoder().encode(process.env.JWT_SECRET!);
 

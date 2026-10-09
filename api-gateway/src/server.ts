@@ -1,12 +1,13 @@
-import express, { Request, Response } from "express";
+import express from "express";
+import type { Request, Response } from "express";
 import { performance } from "node:perf_hooks";
 
-import { matchRoute } from "./routing/router";
-import { authenticate } from "./middleware/auth";
-import { checkRateLimit } from "./middleware/rateLimiter";
-import { transformRequest } from "./transforms/request";
-import { transformResponse } from "./transforms/response";
-import { logRequest } from "./logging/logger";
+import { matchRoute } from "./routing/router.js";
+import { authenticate } from "./middleware/auth.js";
+import { checkRateLimit } from "./middleware/rateLimiter.js";
+import { transformRequest } from "./transforms/request.js";
+import { transformResponse } from "./transforms/response.js";
+import { logRequest } from "./logging/logger.js";
 
 const app = express();
 
@@ -15,7 +16,7 @@ app.use(express.json());
 app.all("*", async (req: Request, res: Response) => {
   const start = performance.now();
 
-  // 1. Find which microservice should handle this request
+  // 1. Find the microservice that should handle this request
   const route = matchRoute(req.path);
 
   if (!route) {
@@ -24,15 +25,19 @@ app.all("*", async (req: Request, res: Response) => {
 
   try {
     // 2. Authenticate the request
+    // Returns JWT claims if authentication succeeds.
     const claims = await authenticate(req, route.auth);
 
     // 3. Identify the client
+    // For JWT requests, use the user's ID.
+    // For API-key requests, use the API key.
+    // Otherwise, treat the client as anonymous.
     const clientId =
       (claims?.sub as string) ||
       req.headers["x-api-key"]?.toString() ||
       "anon";
 
-    // 4. Check rate limit
+    // 4. Check the rate limit
     let rateInfo = {
       allowed: true,
       remaining: 0,
@@ -50,50 +55,84 @@ app.all("*", async (req: Request, res: Response) => {
       }
     }
 
-    // 5. Prepare the request for the microservice
-    const proxyReq = transformRequest(req, route, claims);
+    // 5. Build the request that will be sent to the downstream microservice.
+    const proxyReq = transformRequest(
+      req,
+      route,
+      claims
+    );
 
-    // 6. Send request to the microservice
-    const proxyRes = await fetch(proxyReq);
+    // 6. Forward the request to the microservice.
+    //
+    // transformRequest() returns an object containing the URL, method, headers and body that fetch needs.
+    const proxyRes = await fetch(proxyReq.url, {
+      method: proxyReq.method,
+      headers: proxyReq.headers,
+      ...(proxyReq.body !== undefined &&
+        proxyReq.method !== "GET" &&
+        proxyReq.method !== "HEAD"
+        ? { body: proxyReq.body }
+        : {}),
+      });
 
-    // 7. Transform the microservice response
-    const response = transformResponse(proxyRes, rateInfo);
+    // 7. Transform the microservice response.
+    //
+    // proxyRes is a Fetch API Response.
+    // transformResponse() prepares it for Express.
+    const response = await transformResponse(
+      proxyRes,
+      rateInfo
+    );
 
-    // 8. Log the request
-    logRequest({
-      requestId: req.headers["x-request-id"]?.toString() || "",
-      method: req.method,
-      path: req.path,
-      route: route.prefix,
-      clientId,
-      status: proxyRes.status,
-      durationMs: Math.round(performance.now() - start),
-    });
-
-    // 9. Send response back to client
-    res.status(response.status);
-
+    // 8. Copy the downstream response headers to the Express response.
     response.headers.forEach((value, key) => {
       res.setHeader(key, value);
     });
 
-    const body = await response.text();
+    // 9. Log the request
+    logRequest({
+      requestId: proxyReq.requestId,
+      method: req.method,
+      path: req.path,
+      route: route.prefix,
+      clientId,
+      status: response.status,
+      durationMs: Math.round(
+        performance.now() - start
+      ),
+    });
 
-    return res.send(body);
+    // 10. Send the microservice response
+    // back to the original client.
+    return res
+      .status(response.status)
+      .send(response.body);
 
   } catch (err) {
-    // Authentication errors
-    if (err instanceof AuthError) {
+    // Authentication failures
+    if (
+      err instanceof Error &&
+      (
+        err.message === "Missing token" ||
+        err.message === "Invalid token" ||
+        err.message === "Invalid API key"
+      )
+    ) {
       return res.status(401).send(err.message);
     }
 
-    // Unexpected gateway errors
+    // Unexpected gateway/downstream error
     console.error(err);
 
-    return res.status(502).send("Internal Gateway Error");
+    return res
+      .status(502)
+      .send("Internal Gateway Error");
   }
 });
 
 app.listen(8080, () => {
-  console.log("API Gateway running on http://localhost:8080");
+  console.log(
+    "API Gateway running on http://localhost:8080"
+  );
 });
+
